@@ -246,11 +246,18 @@ Resources:
       ConnectionId: !Ref ApiVpcLink
       PayloadFormatVersion: "1.0"
 
-  ProxyRoute:
+  EmployeesRootRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref HttpApiId
-      RouteKey: !Sub "ANY ${RoutePath}"
+      RouteKey: "ANY /employees"
+      Target: !Sub "integrations/${ApiIntegration}"
+
+  EmployeesProxyRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApiId
+      RouteKey: "ANY /employees/{proxy+}"
       Target: !Sub "integrations/${ApiIntegration}"
 
 Outputs:
