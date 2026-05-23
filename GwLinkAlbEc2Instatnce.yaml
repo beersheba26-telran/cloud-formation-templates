@@ -2,6 +2,25 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: Existing HTTP API -> VPC Link -> Internal ALB -> TG -> EC2 Docker from ECR
 
 Parameters:
+  CognitoUserPoolId:
+    Type: String
+    Default: us-east-1_3Cm6g411Y
+
+  CognitoUserPoolClientId:
+    Type: String
+    Default: 23tv2lapsv03u6soqr4agesgbb
+
+  LambdaEcrImageUri:
+    Type: String
+    Default: 246814138873.dkr.ecr.us-east-1.amazonaws.com/lambda-login:latest
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
   HttpApiId:
     Type: String
     Description: Existing API Gateway HTTP API ID
@@ -245,13 +264,40 @@ Resources:
       ConnectionType: VPC_LINK
       ConnectionId: !Ref ApiVpcLink
       PayloadFormatVersion: "1.0"
-
+  EmployeesCognitoAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApiId
+      Name: !Sub employees-cognito-authorizer-${AWS::StackName}
+      AuthorizerType: JWT
+      IdentitySource:
+        - "$request.header.Authorization"
+      JwtConfiguration:
+        Audience:
+          - !Ref CognitoUserPoolClientId
+        Issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPoolId}"
+  EmployeesRootOptionsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApiId
+      RouteKey: "OPTIONS /employees"
+      Target: !Sub "integrations/${ApiIntegration}"
+      AuthorizationType: NONE
+  EmployeesProxyOptionsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApiId
+      RouteKey: "OPTIONS /employees/{proxy+}"
+      Target: !Sub "integrations/${ApiIntegration}"
+      AuthorizationType: NONE          
   EmployeesRootRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref HttpApiId
       RouteKey: "ANY /employees"
       Target: !Sub "integrations/${ApiIntegration}"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref EmployeesCognitoAuthorizer
 
   EmployeesProxyRoute:
     Type: AWS::ApiGatewayV2::Route
@@ -259,7 +305,69 @@ Resources:
       ApiId: !Ref HttpApiId
       RouteKey: "ANY /employees/{proxy+}"
       Target: !Sub "integrations/${ApiIntegration}"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref EmployeesCognitoAuthorizer
+  LoginLambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApiId
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt CognitoLambdaFunction.Arn
+      PayloadFormatVersion: "2.0"
 
+  LoginRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApiId
+      RouteKey: "ANY /login"
+      Target: !Sub "integrations/${LoginLambdaIntegration}"
+
+  LoginLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CognitoLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApiId}/*/*/login"    
+  CognitoLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub cognito-lambda-role-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CognitoAuthFlows
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:InitiateAuth
+                  - cognito-idp:AdminInitiateAuth
+                  - cognito-idp:RespondToAuthChallenge
+                  - cognito-idp:AdminRespondToAuthChallenge
+                Resource: !Sub "arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${CognitoUserPoolId}"
+
+  CognitoLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub cognito-login-${AWS::StackName}
+      Role: !GetAtt CognitoLambdaRole.Arn
+      PackageType: Image
+      Code:
+        ImageUri: !Ref LambdaEcrImageUri
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          COGNITO_CLIENT_ID: !Ref CognitoUserPoolClientId
 Outputs:
   InternalAlbDnsName:
     Value: !GetAtt InternalAlb.DNSName
@@ -272,3 +380,11 @@ Outputs:
 
   ApiRoute:
     Value: !Sub "ANY ${RoutePath}"
+  CognitoAuthorizerId:
+    Value: !Ref EmployeesCognitoAuthorizer
+
+  CognitoLambdaFunctionName:
+    Value: !Ref CognitoLambdaFunction
+
+  CognitoLambdaFunctionArn:
+    Value: !GetAtt CognitoLambdaFunction.Arn  
