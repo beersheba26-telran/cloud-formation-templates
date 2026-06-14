@@ -1,0 +1,407 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Existing HTTP API -> VPC Link -> Internal ALB -> TG -> ECS/Fargate from ECR
+
+Parameters:
+  HttpApiId:
+    Type: String
+    Description: Existing API Gateway HTTP API ID
+    Default: qrfd5s2xt9
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-0f2a9e73cc1dc3c26
+
+  AlbSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets in different AZs for the internal ALB, VPC Link, and Fargate tasks
+
+  EcrImageUri:
+    Type: String
+    Description: Example 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app:latest
+    Default: 246814138873.dkr.ecr.us-east-1.amazonaws.com/pulse-monitoring-be
+
+  SecretArn:
+    Type: String
+    Default: arn:aws:secretsmanager:us-east-1:246814138873:secret:DB_PASSWORD-McVmoG
+
+  ContainerPort:
+    Type: Number
+    Default: 3000
+
+  HealthCheckPath:
+    Type: String
+    Default: /health
+
+  FargateCpu:
+    Type: String
+    Default: "256"
+    AllowedValues:
+      - "256"
+      - "512"
+      - "1024"
+      - "2048"
+      - "4096"
+
+  FargateMemory:
+    Type: String
+    Default: "512"
+    AllowedValues:
+      - "512"
+      - "1024"
+      - "2048"
+      - "3072"
+      - "4096"
+      - "5120"
+      - "6144"
+      - "7168"
+      - "8192"
+
+  ServiceMinCapacity:
+    Type: Number
+    Default: 1
+    Description: Minimum number of ECS tasks
+
+  ServiceDesiredCount:
+    Type: Number
+    Default: 2
+    Description: Initial desired number of ECS tasks
+
+  ServiceMaxCapacity:
+    Type: Number
+    Default: 4
+    Description: Maximum number of ECS tasks
+
+  RequestsPerTaskTarget:
+    Type: Number
+    Default: 3
+    Description: Target average number of ALB requests per ECS task
+
+Resources:
+  ApiGatewayVpcLinkSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for API Gateway VPC Link
+      VpcId: !Ref VpcId
+
+  AlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal ALB security group
+      VpcId: !Ref VpcId
+
+  FargateServiceSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS Fargate app security group
+      VpcId: !Ref VpcId
+
+  VpcLinkToAlbEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ApiGatewayVpcLinkSG
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      DestinationSecurityGroupId: !Ref AlbSG
+
+  AlbFromVpcLinkIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AlbSG
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref ApiGatewayVpcLinkSG
+
+  AlbToFargateEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AlbSG
+      IpProtocol: tcp
+      FromPort: !Ref ContainerPort
+      ToPort: !Ref ContainerPort
+      DestinationSecurityGroupId: !Ref FargateServiceSG
+
+  FargateFromAlbIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref FargateServiceSG
+      IpProtocol: tcp
+      FromPort: !Ref ContainerPort
+      ToPort: !Ref ContainerPort
+      SourceSecurityGroupId: !Ref AlbSG
+
+  FargateAllOutbound:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref FargateServiceSG
+      IpProtocol: -1
+      CidrIp: 0.0.0.0/0
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub app-cluster-${AWS::StackName}
+
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/app-${AWS::StackName}
+      RetentionInDays: 7
+
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ecs-task-execution-role-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ecs-task-role-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SecretsManagerReadAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref SecretArn
+
+  AppTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub app-task-${AWS::StackName}
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: !Ref FargateCpu
+      Memory: !Ref FargateMemory
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt EcsTaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref EcrImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          Environment:
+            - Name: PORT
+              Value: !Ref ContainerPort
+            - Name: SECRET_ARN
+              Value: !Ref SecretArn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AppLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub app-tg-${AWS::StackName}
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: !Ref ContainerPort
+      TargetType: ip
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: !Ref HealthCheckPath
+      Matcher:
+        HttpCode: "200"
+
+  InternalAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub inner-alb-${AWS::StackName}
+      Type: application
+      Scheme: internal
+      Subnets: !Ref AlbSubnetIds
+      SecurityGroups:
+        - !Ref AlbSG
+
+  AlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref InternalAlb
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - AlbListener
+    Properties:
+      ServiceName: !Sub app-service-${AWS::StackName}
+      Cluster: !Ref EcsCluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref ServiceDesiredCount
+      HealthCheckGracePeriodSeconds: 60
+      TaskDefinition: !Ref AppTaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref FargateServiceSG
+          Subnets: !Ref AlbSubnetIds
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref AppTargetGroup
+
+  EcsServiceScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn:
+      - EcsService
+    Properties:
+      MinCapacity: !Ref ServiceMinCapacity
+      MaxCapacity: !Ref ServiceMaxCapacity
+      ResourceId: !Sub
+        - service/${ClusterName}/${ServiceName}
+        - ClusterName: !Ref EcsCluster
+          ServiceName: !GetAtt EcsService.Name
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  EcsRequestCountScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub app-ecs-request-count-scaling-${AWS::StackName}
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref EcsServiceScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: !Ref RequestsPerTaskTarget
+        ScaleInCooldown: 100
+        ScaleOutCooldown: 100
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Join
+            - "/"
+            - - !GetAtt InternalAlb.LoadBalancerFullName
+              - !GetAtt AppTargetGroup.TargetGroupFullName
+
+  ApiVpcLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties:
+      Name: !Sub http-api-vpclink-${AWS::StackName}
+      SubnetIds: !Ref AlbSubnetIds
+      SecurityGroupIds:
+        - !Ref ApiGatewayVpcLinkSG
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApiId
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      IntegrationUri: !Ref AlbListener
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref ApiVpcLink
+      PayloadFormatVersion: "1.0"
+
+  NotificationsRootOptionsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApiId
+      RouteKey: "OPTIONS /notifications"
+      Target: !Sub "integrations/${ApiIntegration}"
+      AuthorizationType: NONE
+
+  NotificationsProxyOptionsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApiId
+      RouteKey: "OPTIONS /notifications/{proxy+}"
+      Target: !Sub "integrations/${ApiIntegration}"
+      AuthorizationType: NONE
+
+  NotificationsRootRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApiId
+      RouteKey: "ANY /notifications"
+      Target: !Sub "integrations/${ApiIntegration}"
+      AuthorizationType: NONE
+
+  NotificationsProxyRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApiId
+      RouteKey: "ANY /notifications/{proxy+}"
+      Target: !Sub "integrations/${ApiIntegration}"
+      AuthorizationType: NONE
+
+  PatientRootOptionsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApiId
+      RouteKey: "OPTIONS /patient"
+      Target: !Sub "integrations/${ApiIntegration}"
+      AuthorizationType: NONE
+
+  PatientProxyOptionsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApiId
+      RouteKey: "OPTIONS /patient/{proxy+}"
+      Target: !Sub "integrations/${ApiIntegration}"
+      AuthorizationType: NONE
+
+  PatientRootRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApiId
+      RouteKey: "ANY /patient"
+      Target: !Sub "integrations/${ApiIntegration}"
+      AuthorizationType: NONE
+
+  PatientProxyRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApiId
+      RouteKey: "ANY /patient/{proxy+}"
+      Target: !Sub "integrations/${ApiIntegration}"
+      AuthorizationType: NONE
+
+Outputs:
+  InternalAlbDnsName:
+    Value: !GetAtt InternalAlb.DNSName
+
+  TargetGroupArn:
+    Value: !Ref AppTargetGroup
+
+  EcsClusterName:
+    Value: !Ref EcsCluster
+
+  EcsServiceName:
+    Value: !GetAtt EcsService.Name
+
+  VpcLinkId:
+    Value: !Ref ApiVpcLink
+
+  NotificationsApiRoute:
+    Value: "ANY /notifications/{proxy+}"
+
+  PatientApiRoute:
+    Value: "ANY /patient/{proxy+}"
